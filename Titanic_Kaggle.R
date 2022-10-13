@@ -1,4 +1,5 @@
 library(tidyverse)
+library(rvest)
 
 filepath_train <- "D:/Users/Gregor/Desktop/Kaggle/Titanic/train.csv"
 filepath_test <- "D:/Users/Gregor/Desktop/Kaggle/Titanic/test.csv"
@@ -91,12 +92,14 @@ titanic_data_clean <- titanic_data_clean %>%
                                     cabin_letter == "C" & cabin_number %in% c_back ~ "CB",
                                     cabin_letter == "D" & cabin_number <= 50 ~ "DF",
                                     cabin_letter == "D" & cabin_number > 50 ~ "DB",
+                                    cabin_letter == "D" & is.na(cabin_number) ~ "DB",
                                     cabin_letter == "E" & cabin_number <= 27 | cabin_number %in% 200:203 ~ "EF",
                                     cabin_letter == "E" & cabin_number %in% 28:76 ~ "EM",
-                                    cabin_letter == "E" & cabin_number %in% 77:107 ~ "EB",
+                                    cabin_letter == "E" & cabin_number %in% 77:167 ~ "EB",
                                     cabin_letter == "F"  ~ "FB",
                                     cabin_letter == "G"  ~ "GB",
-                                    is.na(cabin_letter) ~ "Other"))
+                                    cabin_letter == "T" ~ "T",
+                                    is.na(cabin_letter) ~ "Unknown"))
 
 #Now that we have our cabin_position variable, we can delete the cabin_letter and cabin_number as well as transform all of the other variables in the correct type.
 
@@ -105,3 +108,99 @@ titanic_data_clean <- titanic_data_clean %>%
   mutate(Sex = factor(Sex),
          Embarked = factor(Embarked),
          cabin_position = factor(cabin_position))
+
+summary(titanic_data_clean)
+
+
+page <- read_html("https://en.wikipedia.org/wiki/Passengers_of_the_Titanic") #Wikipedia page about Titanic passengers
+
+alltables <- page %>% html_table(fill = T) #We read the wikipedia website contents
+
+table1 <- alltables[[2]] #We extract the 3 tables that contain information about the passengers
+table2 <- alltables[[3]]
+table3 <- alltables[[4]]
+
+head(table1)
+head(titanic_data_clean)
+
+name_remove <- c("Mr.", "Miss.", "Master.", "and", "chauffeur", "maid", "nurse", "valet", "manservant", "Reverend", " dragoman", "clerk", "secretary") #We list common words, which were parts of names, but weren't names
+
+titanic_data_names <- titanic_data_clean
+
+titanic_data_names$Name <- str_remove_all(titanic_data_names$Name, paste(name_remove, collapse = "|")) #We remove all the titles from the names
+titanic_data_names$Name <- gsub("[[:punct:]]", "", titanic_data_names$Name) #We remove all the punctuation from the names
+
+table3 <- select(table3, - 'Home country') %>% #We remove the additional infromation from table 3, which is not important for us
+  mutate(Age = age) %>%
+  select(- age)
+
+wikitable <- bind_rows(table1, table2, table3) #Bind all three tables together
+
+wikitable <- wikitable %>% #Selecting just the name and the age from the wikipedia tables
+  select(Name, Age)
+
+wikitable$Name <- str_remove_all(wikitable$Name, paste(name_remove, collapse = "|"))
+wikitable$Name <- gsub("[[:punct:]]", "", wikitable$Name)
+wikitable$Name <- str_remove_all(wikitable$Name, "[:digit:]") #Cleaning the entries
+
+join_table <- left_join(titanic_data_names, wikitable, by = "Name", suffix = c(".kaggle", ".wiki")) #We join the two tables, prefering the original
+sum(is.na(join_table$Age.wiki)) #We see that joining didn't work perfectly. There is 544 resulting NA's 
+view(join_table) #One case of data missing from the original dataset and a bad join is for instance Passenger ID 20
+
+join_table[20, ] #Taking a look at it, we focus on the name
+join_table[20, ]$Name
+
+wikitable[grepl("Masselmani", wikitable$Name), ] #Searching for Masselmani finds no match in the data from Wikipedia
+wikitable[grepl("Fatima", wikitable$Name), ] #Searching for first name, we can find the match. The reason is a slightly differently spelled surname.
+
+join_table[(is.na(join_table$Age.kaggle) & is.na(join_table$Age.wiki)), ] #In total we have 99 cases, where we dont have the data in the originial dataset, nor was there found a match in the wikipedia one
+
+#join_table$Age.wiki <- as.numeric(join_table$Age.wiki)
+
+join_table <- join_table %>%
+  mutate(Age = case_when(!is.na(Age.kaggle) ~ Age.kaggle,
+                         is.na(Age.kaggle) & !is.na(Age.wiki) ~ Age.wiki,
+                         TRUE ~ NA_real_)) %>%
+  select(-c(Age.kaggle, Age.wiki)) #We supplement the original values with the ones we got from wikipedia, where applicable
+
+#Instead of manually filling in the rest 102 NAs, we're going to impute the values based on the Pclass and the number of siblings
+titanic_data_clean <- join_table
+
+mean(titanic_data_clean$Age, na.rm = T) #Mean age of whole training dataset is 29.7
+
+avg_ages <- titanic_data_clean %>% #We make a table grouped by Passenger Class and number of siblings on board
+  drop_na() %>%
+  group_by(Pclass, SibSp) %>%
+  summarize(avimp = round(mean(Age))) %>%
+  ungroup()
+
+#avg_ages$avimp <- as.numeric(avg_ages$avimp)
+
+titanic_data_clean <- titanic_data_clean %>%
+  mutate(Age = case_when(!is.na(Age) ~ Age,
+                         is.na(Age) & Pclass == 1 & SibSp == 0 ~ avg_ages[[1,3]], #We manually impute based on the grouped values
+                         is.na(Age) & Pclass == 1 & SibSp == 1 ~ avg_ages[[2,3]],
+                         is.na(Age) & Pclass == 1 & SibSp == 2 ~ avg_ages[[3,3]],
+                         is.na(Age) & Pclass == 1 & SibSp >= 3 ~ avg_ages[[4,3]],
+                         is.na(Age) & Pclass == 2 & SibSp == 0 ~ avg_ages[[5,3]],
+                         is.na(Age) & Pclass == 2 & SibSp == 1 ~ avg_ages[[6,3]],
+                         is.na(Age) & Pclass == 2 & SibSp == 2 ~ avg_ages[[7,3]],
+                         is.na(Age) & Pclass == 2 & SibSp >= 3 ~ avg_ages[[8,3]],
+                         is.na(Age) & Pclass == 3 & SibSp == 0 ~ avg_ages[[9,3]],
+                         is.na(Age) & Pclass == 3 & SibSp == 1 ~ avg_ages[[10,3]],
+                         is.na(Age) & Pclass == 3 & SibSp == 2 ~ avg_ages[[11,3]],
+                         is.na(Age) & Pclass == 3 & SibSp == 3 ~ avg_ages[[12,3]],
+                         is.na(Age) & Pclass == 3 & SibSp == 4 ~ avg_ages[[13,3]],
+                         is.na(Age) & Pclass == 3 & SibSp == 5 ~ avg_ages[[14,3]],
+                         is.na(Age) & Pclass == 3 & SibSp >= 6 ~ avg_ages[[15,3]],
+                         TRUE ~ NA_real_),
+         Embarked = ifelse(is.na(Embarked), "S", Embarked)) #We also fill in the 2 NA's from Embarked with the most common value
+
+titanic_data_clean$Embarked <- as.factor(titanic_data_clean$Embarked) #Transform it to a factor. We now have a clean dataset without NAs
+
+titanic_data_mod <- titanic_data_clean %>% 
+  select(-c(Name, Ticket, Embarked, Fare)) %>% #We remove variables we won't use in modeling
+  mutate(Survived = as.factor(Survived), #We turn the survived and Pclass variables to factors
+         Pclass = as.factor(Pclass))
+
+summary(titanic_data_mod) #Everything seems clean and ready for modelling.
