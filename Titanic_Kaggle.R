@@ -14,7 +14,12 @@ glimpse(titanic_data) #Taking a glimpse, we need to recode Pclass, Sex, Ticket, 
 table(titanic_data$Ticket) #Taking a look at all the different combinations of tickets.
 #We see that most tickets are just numbers, while some have additional info (PC, SOTON, SOC,...). Some are also repeated several times
 
-duplicated_tickets <- titanic_data %>% #We filter out the duplicated tickets
+comb_data <- bind_rows(titanic_data, test_data)
+
+comb_data <- comb_data %>%
+  mutate(train = ifelse(PassengerId %in% 1:891, 1, 0))
+
+duplicated_tickets <- comb_data %>% #We filter out the duplicated tickets
   group_by(Ticket) %>%
   filter(n() > 1) %>%
   ungroup()
@@ -31,6 +36,8 @@ duplicated_tickets_table <- duplicated_tickets %>%  #We add a total column, to s
   arrange(desc(total)) %>%
   ungroup()
 
+duplicated_tickets_table
+
 duplicated_tickets_table %>%
   filter(grepl("CA", Ticket))
 
@@ -38,7 +45,7 @@ duplicated_tickets_table %>%
   filter(grepl("S.O.C", Ticket)) #Looking at a couple of examples, it appears that our theory of group tickets might be right. We can see some families forming groups for instance.
 #In order for the ticket variable to more closely resemble reality, we will divide the price of the tickets by the duplicates and save the new variable as fare_real
 
-titanic_data_clean <- titanic_data %>%
+titanic_data_clean <- comb_data %>%
   group_by(Ticket) %>%
   mutate(total = n()) %>%
   mutate(fare_real = Fare / total) %>%
@@ -50,10 +57,10 @@ table(titanic_data_clean$Cabin) #We see that cabins range from A to G.
 #It seems reasonable to assume people on the upper decks had a higher survival rate than on the bottom. Also the number of the cabin can give us information concerning the relative location of the cabin
 #on the ship. The cabin locations are available on the ship's deckplans (https://www.encyclopedia-titanica.org/titanic-deckplans/)
 
-dup_cabs <- c("B51 B53 B55", "B57 B59 B63 B66", "B58 B60", "B82 B84", "B96 B98", "C22 C26", "C23 C25 C27", "C62 C64", "D10 D12", "F E69", "F G63", "F G73") #We isolate the cabins with more than 1 number
+dup_cabs <- c("B51 B53 B55", "B52 B54 B56", "B57 B59 B63 B66", "B58 B60", "B82 B84", "B96 B98", "C22 C26", "C23 C25 C27", "C55 C57", "C62 C64", "D10 D12", "E39 E41", "F E46", "F E57", "F E69", "F G63", "F G73") #We isolate the cabins with more than 1 number
 dup_ind <- which(titanic_data_clean$Cabin %in% dup_cabs) #We save these in a separate index
 
-print(titanic_data_clean[dup_ind, ], n = 24) #We see that the cabins with more than 1 value relate to cabins occupied by family members or such, so it should be reasonably ok to keep just one of the values
+print(titanic_data_clean[dup_ind, ], n = 41) #We see that the cabins with more than 1 value relate to cabins occupied by family members or such, so it should be reasonably ok to keep just one of the values
 
 titanic_data_clean <- titanic_data_clean %>%
   separate(Cabin, c("cabin_letter", "cabin_number"), sep = 1) #first we separate the Cabin variable to the letter(floor) and number(location)
@@ -153,9 +160,9 @@ join_table[20, ]$Name
 wikitable[grepl("Masselmani", wikitable$Name), ] #Searching for Masselmani finds no match in the data from Wikipedia
 wikitable[grepl("Fatima", wikitable$Name), ] #Searching for first name, we can find the match. The reason is a slightly differently spelled surname.
 
-join_table[(is.na(join_table$Age.kaggle) & is.na(join_table$Age.wiki)), ] #In total we have 99 cases, where we dont have the data in the originial dataset, nor was there found a match in the wikipedia one
+join_table[(is.na(join_table$Age.kaggle) & is.na(join_table$Age.wiki)), ] #In total we have 154 cases, where we dont have the data in the originial dataset, nor was there found a match in the wikipedia one
 
-#join_table$Age.wiki <- as.numeric(join_table$Age.wiki)
+join_table$Age.wiki <- as.numeric(join_table$Age.wiki)
 
 join_table <- join_table %>%
   mutate(Age = case_when(!is.na(Age.kaggle) ~ Age.kaggle,
@@ -166,7 +173,7 @@ join_table <- join_table %>%
 #Instead of manually filling in the rest 102 NAs, we're going to impute the values based on the Pclass and the number of siblings
 titanic_data_clean <- join_table
 
-mean(titanic_data_clean$Age, na.rm = T) #Mean age of whole training dataset is 29.7
+mean(titanic_data_clean$Age, na.rm = T) #Mean age of whole training dataset is 29.9
 
 avg_ages <- titanic_data_clean %>% #We make a table grouped by Passenger Class and number of siblings on board
   drop_na() %>%
@@ -174,7 +181,7 @@ avg_ages <- titanic_data_clean %>% #We make a table grouped by Passenger Class a
   summarize(avimp = round(mean(Age))) %>%
   ungroup()
 
-#avg_ages$avimp <- as.numeric(avg_ages$avimp)
+avg_ages
 
 titanic_data_clean <- titanic_data_clean %>%
   mutate(Age = case_when(!is.na(Age) ~ Age,
@@ -194,7 +201,8 @@ titanic_data_clean <- titanic_data_clean %>%
                          is.na(Age) & Pclass == 3 & SibSp == 5 ~ avg_ages[[14,3]],
                          is.na(Age) & Pclass == 3 & SibSp >= 6 ~ avg_ages[[15,3]],
                          TRUE ~ NA_real_),
-         Embarked = ifelse(is.na(Embarked), "S", Embarked)) #We also fill in the 2 NA's from Embarked with the most common value
+         Embarked = ifelse(is.na(Embarked), "S", Embarked),
+         fare_real = ifelse(is.na(fare_real), median(fare_real, na.rm = T), fare_real)) #We also fill in the 2 NA's from Embarked with the most common value, and the missing fare_real value
 
 titanic_data_clean$Embarked <- as.factor(titanic_data_clean$Embarked) #Transform it to a factor. We now have a clean dataset without NAs
 
@@ -204,3 +212,6 @@ titanic_data_mod <- titanic_data_clean %>%
          Pclass = as.factor(Pclass))
 
 summary(titanic_data_mod) #Everything seems clean and ready for modelling.
+
+mod_train <- subset(titanic_data_mod, train == 1)
+mod_test <- subset(titanic_data_mod, train == 0)
