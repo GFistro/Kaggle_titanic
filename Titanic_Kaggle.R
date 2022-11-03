@@ -2,6 +2,7 @@ library(tidyverse)
 library(rvest)
 library(caret)
 library(pROC)
+library(caretEnsemble)
 
 titanic_data <- read_csv("D:/Users/Gregor/Desktop/Kaggle/Titanic/train.csv") #Import training data
 test_data <- read_csv("D:/Users/Gregor/Desktop/Kaggle/Titanic/test.csv") #Import testing data
@@ -164,7 +165,7 @@ comb_data$cabin_letter <- as.factor(comb_data$cabin_letter)
 table(comb_data$cabin_position) #Some of them are very rare, might be problematic
 summary(comb_data)
 
-#We continue with dealing with NA's from the Age variable. We will download a table from wihipedia and try to join it to our original data
+#We continue with dealing with NA's from the Age variable. We will download a table from Wikipedia and try to join it to our original data
 
 page <- read_html("https://en.wikipedia.org/wiki/Passengers_of_the_Titanic") #Wikipedia page about Titanic passengers
 
@@ -221,6 +222,15 @@ sum(is.na(join_table$Age)) #We have 156 missing Age values in the joined table
 sum(is.na(comb_data$Age)) #There was 263 missing Age values in total, so it worked to some extent
 
 #Instead of manually filling in the rest of the 156 NAs, we're going to impute the values based on the Pclass and the number of siblings
+which(duplicated(join_table)) #Check for duplicates after joining
+
+join_table[697:698,] #Taking a look at the two duplicates to confirm
+join_table[893:894, ]
+join_table[c(698, 894), ] #We see there are Two Kelly James's in the dataset
+
+join_table <- join_table[-c(698,894), ] #Removing the duplicates
+which(duplicated(join_table)) #No duplicates left
+
 titanic_data_clean <- join_table
 
 median(titanic_data_clean$Age, na.rm = T) #Median age of whole training dataset is 28
@@ -254,16 +264,50 @@ titanic_data_clean <- titanic_data_clean %>%
          Embarked = ifelse(is.na(Embarked), "S", Embarked),
          fare_real = ifelse(is.na(fare_real), median(fare_real, na.rm = T), fare_real)) #We also fill in the 2 NA's from Embarked with the most common value, and the missing fare_real value
 
+
+titanic_data_clean[1:891, ] %>%
+  group_by(cabin_position) %>%
+  mutate(sur_rate = mean(as.numeric(Survived) - 1), tot = n()) %>%
+  ungroup() %>%
+  ggplot(aes(x = cabin_position, y = sur_rate)) +
+    geom_point() +
+    geom_text(aes(label = tot, vjust = -1), size = 3) #Looking at the survival distribution by the cabin_position
+
+
+titanic_data_clean[1:891, ] %>%
+  group_by(cabin_letter) %>%
+  mutate(sur_rate = mean(as.numeric(Survived) - 1), tot = n()) %>%
+  ungroup() %>%
+  ggplot(aes(x = cabin_letter, y = sur_rate)) +
+  geom_point() +
+  geom_text(aes(label = tot, vjust = -1), size = 3) #Looking at the survival distribution by deck
+
+
 titanic_data_clean$Embarked <- as.factor(titanic_data_clean$Embarked) #Transform it to a factor. We now have a clean dataset without NAs
+
+
+ggplot(titanic_data_clean[1:891, ], aes(x = Survived, y = Age)) +
+  geom_violin()
+
+titanic_data_clean$child <- as.factor(ifelse(titanic_data_clean$Age <= 15, 1, 0)) #We also define a new variable children, which is 1 for every person under 15 years old
+
+age_survival <- titanic_data_clean[1:891, ] %>%
+                  group_by(Age) %>%
+                  summarise(survival = mean(as.numeric(Survived) - 1), tot = n())
+
+ggplot(age_survival, aes(x = Age, y = survival)) +
+  geom_point(aes(size = tot)) +
+  geom_vline(xintercept = 15) + #Before the cutoff at age 15, we see some higher survival rates 
+  geom_hline(yintercept = mean(as.numeric(titanic_data_clean[1:891, ]$Survived) - 1))
+
 
 titanic_data_mod <- titanic_data_clean %>% 
   select(-c(PassengerId, Name, Ticket, Embarked, Fare)) %>% #We remove variables we won't use in modeling
   mutate(Survived = as.factor(Survived), #We turn the survived and Pclass variables to factors
          Pclass = as.factor(Pclass))
 
-titanic_data_mod$child <- as.factor(ifelse(titanic_data_mod$Age <= 15, 1, 0)) #We also define a new variable children, which is 1 for every person under 15 years old
-
 summary(titanic_data_mod) #Everything seems clean and ready for modelling.
+
 
 #We split the combined dataset back into the training and test dataset
 mod_train <- subset(titanic_data_mod, train == 1)
@@ -294,6 +338,7 @@ xgb_grid <- expand.grid(max_depth = 1:10,
                         min_child_weight = seq(0, 20, 2),
                         subsample = c(0.1, 0.3, 0.5))
 
+#XGBoost
 set.seed(845)
 xgbfit1 <- train(Survived ~ ., data = train[, -6],
                  method = "xgbTree",
@@ -301,96 +346,245 @@ xgbfit1 <- train(Survived ~ ., data = train[, -6],
 
 xgbfit1$finalModel
 
-xgbpreds1 <- predict(xgbfit1, newdata = test, type = "prob")
-xgbpreds1 <- ifelse(xgbpreds1[, 1] > 0.5, 0, 1)
+xgbprobs <- predict(xgbfit1, newdata = test, type = "prob")[, 2]
+xgbpreds <- predict(xgbfit1, newdata = test)
 
-mean(xgbpreds1 == test$Survived) #84.6% accuracy
-auc(test$Survived, xgbpreds1) #AUC of 0.825
+mean(xgbpreds == test$Survived) #84.6% accuracy
+auc(test$Survived, xgbprobs) #AUC of 0.877
 
 set.seed(751)
 xgbfit2 <- train(Survived ~ ., data = train[, -9],
                  method = "xgbTree",
                  trControl = fit_control)
 
-xgbpreds2 <- predict(xgbfit2, newdata = test, type = "prob")
-xgbpreds2 <- ifelse(xgbpreds2[, 1] > 0.5, 0, 1)
+xgbprobs2 <- predict(xgbfit2, newdata = test, type = "prob")[, 2]
+xgbpreds2 <- ifelse(xgbprobs2 > 0.5, 1, 0)
 
-mean(xgbpreds2 == test$Survived) #We get 83.5% Accuracy
-auc(test$Survived, xgbpreds2) #AUC of 0.822
+mean(xgbpreds2 == test$Survived) #We get 84.3% Accuracy
+auc(test$Survived, xgbprobs2) #AUC of 0.878
 
-glmfit1 <- glm(Survived ~ ., data = train[, -6], family = "binomial")
+xgresults <- resamples(list(cabins = xgbfit1, deck = xgbfit2))
+summary(xgresults)
+dotplot(xgresults)
 
-glmpreds <- predict(glmfit1, newdata = test, type = "response")
-glmpreds <- ifelse(glmpreds > 0.5, 1, 0)
+#GLM
+set.seed(753)
+glmfit1 <- train(Survived ~ ., data = train[, -6],
+                 method = "glmnet",
+                 trControl = fit_control)
+
+
+glmpreds <- predict(glmfit1, newdata = test)
+glmprobs <- predict(glmfit1, newdata = test, type = "prob")[, 2]
 mean(glmpreds == test$Survived) #80.5% accuracy
-auc(test$Survived, glmpreds) #AUC of 0.778
+auc(test$Survived, glmprobs) #AUC of 0.873
 
-glmfit2 <- glm(Survived ~ ., data = train[, -9], family = "binomial")
+set.seed(754)
+glmfit2 <- train(Survived ~ ., data = train[, -9],
+                 method = "glmnet",
+                 trControl = fit_control)
 
-glmpreds2 <- predict(glmfit2, newdata = test, type = "response")
-glmpreds2 <- ifelse(glmpreds2 > 0.5, 1, 0)
+glmpreds2 <- predict(glmfit2, newdata = test)
+glmprobs2 <- predict(glmfit2, newdata = test, type = "prob")[, 2]
 mean(glmpreds2 == test$Survived) #78.2% accuracy
-auc(test$Survived, glmpreds2) #AUC of 0.759
+auc(test$Survived, glmprobs2) #AUC of 0.864
 
 
-rffit1 <- train(Survived ~ ., data = train[, -6],
+#Random Forrest
+rftrain <- train
+levels(rftrain$Survived) <- c("Died", "Survived") #Add names so that we can get class probabilities with Ranger
+
+set.seed(755)
+rffit1 <- train(Survived ~ ., data = rftrain[, -6],
                 method = "ranger",
-                trControl = fit_control)
+                trControl = trainControl(method="repeatedcv", number = 10, repeats = 10, classProbs = T))
 
-rfpreds <- predict(rffit1, newdata = test)
-mean(rfpreds == test$Survived) #84.3% accuracy
-auc(test$Survived, as.numeric(rfpreds) - 1) #AUC of 0.817
+rfpreds <- as.numeric(predict(rffit1, newdata = test)) - 1
+rfprobs <- predict(rffit1, newdata = test, type = "prob")[, 2]
+mean(rfpreds == test$Survived) #84.6% accuracy
+auc(test$Survived, rfprobs) #AUC of 0.862
 
 
-rffit2 <- train(Survived ~ ., data = train[, -9],
+set.seed(756)
+rffit2 <- train(Survived ~ ., data = rftrain[, -9],
                 method = "ranger",
-                trControl = fit_control)
+                trControl = trainControl(method="repeatedcv", number = 10, repeats = 10, classProbs = T))
 
-rfpreds2 <- predict(rffit2, newdata = test)
-mean(rfpreds2 == test$Survived) #82.4% accuracy
-auc(test$Survived, as.numeric(rfpreds2) - 1) #AUC of 0.805
-
-
-bayfit <- train(Survived ~ ., data = train[, -6],
-                method = "naive_bayes",
-                trControl = fit_control)
-
-baypreds <- predict(bayfit, newdata = test)
-mean(baypreds == test$Survived) #68.9% accuracy
-auc(test$Survived, as.numeric(baypreds) - 1) #AUC of 0.597
+rfpreds2 <- as.numeric(predict(rffit2, newdata = test)) - 1
+rfprobs2 <- predict(rffit2, newdata = test, type = "prob")[, 2]
+mean(rfpreds2 == test$Survived) #83.9% accuracy
+auc(test$Survived, rfprobs2) #AUC of 0.866
 
 
+
+#Bayes GLM
+set.seed(757)
 bayglmfit <- train(Survived ~ ., data = train[, -6],
                 method = "bayesglm",
                 trControl = fit_control)
 
 bayglmpreds <- predict(bayglmfit, newdata = test)
-mean(bayglmpreds == test$Survived) #80% accuracy
-auc(test$Survived, as.numeric(bayglmpreds) - 1) #AUC of 0.774
+bayglmprobs <- predict(bayglmfit, newdata = test, type = "prob")[, 2]
+mean(bayglmpreds == test$Survived) #80.1% accuracy
+auc(test$Survived, bayglmprobs) #AUC of 0.871
 
 
+
+#Neural Networks
+set.seed(758)
 nnfit <- train(Survived ~ ., data = train[, -6],
                method = "avNNet",
                trControl = fit_control)
 
 nnpreds <- predict(nnfit, newdata = test)
-mean(nnpreds == test$Survived) #81.6% accuracy
-auc(test$Survived, as.numeric(nnpreds) - 1) #AUC of 0.788
+nnprobs <- predict(nnfit, newdata = test, type = "prob")[, 2]
+mean(nnpreds == test$Survived) #80.5% accuracy
+auc(test$Survived, nnprobs) #AUC of 0.864
 
 
+
+#GLM Boost
+set.seed(759)
 glmbfit <- train(Survived ~ ., data = train[, -6],
                method = "glmboost",
                trControl = fit_control)
 
 glmbpreds <- predict(glmbfit, newdata = test)
+glmbprobs <- predict(glmbfit, newdata = test, type = "prob")[, 2]
 mean(glmbpreds == test$Survived) #79.4% accuracy
-auc(test$Survived, as.numeric(glmbpreds) - 1) #AUC of 0.766
+auc(test$Survived, glmbprobs) #AUC of 0.868
 
 
+
+#ADA Boost
+set.seed(760)
 adafit <- train(Survived ~ ., data = train[, -6],
                  method = "ada",
                  trControl = fit_control)
 
 adapreds <- predict(adafit, newdata = test)
-mean(adapreds == test$Survived) #83.5% accuracy
-auc(test$Survived, as.numeric(adapreds) - 1) #AUC of 0.811
+adaprobs <- predict(adafit, newdata = test, type = "prob")[, 2]
+mean(adapreds == test$Survived) #82.4% accuracy
+auc(test$Survived, adaprobs) #AUC of 0.876
+
+
+#SVM model
+set.seed(761)
+svmfit <- train(Survived ~ ., data = train[, -6],
+                method = "svmRadialSigma",
+                trControl = fit_control,
+                prob.model = TRUE)
+
+svmpreds <- predict(svmfit, newdata = test)
+svmprobs <- predict(svmfit, newdata = test, type = "prob")[, 2]
+mean(svmpreds == test$Survived) #83.1% Accuracy
+auc(test$Survived, svmprobs) #0.831 AUC
+
+
+#LDA model
+set.seed(762)
+ldafit <- train(Survived ~ ., data = train[, -6],
+                method = "lda",
+                trControl = fit_control)
+
+ldapreds <- predict(ldafit, newdata = test)
+ldaprobs <- predict(ldafit, newdata = test, type = "prob")[, 2]
+mean(ldapreds == test$Survived) #80.1% Accuracy
+auc(test$Survived, ldaprobs) #0.867 AUC
+
+
+
+#KNN model
+set.seed(763)
+knnfit <- train(Survived ~ ., data = train[, -6],
+                method = "knn",
+                trControl = fit_control)
+
+knnpreds <- predict(knnfit, newdata = test)
+knnprobs <- predict(knnfit, newdata = test, type = "prob")[, 2]
+mean(knnpreds == test$Survived) #73% Accuracy
+auc(test$Survived, knnprobs) #AUC of 0.80
+
+
+#Stacked model
+stack_control <- trainControl(method = "repeatedcv", number = 10, repeats = 5, savePredictions = T, classProbs = T)
+algorithm_list <- c("xgbTree", "glmnet", "ranger", "bayesglm", "avNNet", "glmboost", "ada", "svmRadialSigma", "lda", "knn")
+
+set.seed(764)
+stack_models <- caretList(Survived ~ ., data = rftrain[, -6], 
+                          trControl = stack_control,
+                          methodList = algorithm_list)
+
+stack_results <- resamples(stack_models)
+summary(stack_results) #We can see many models performing similarly well, with ranger and XGBoost and NN performing the best
+dotplot(stack_results)
+
+modelCor(stack_results) #As expected, there is strong correlation (> 0.75) between XGBoost and ranger and the various types of GLMs
+splom(stack_results)
+
+#Due to the correlations, we will choose the algorithms that are the best performing and least correlated. So we choose xgbTree, beacuse it has lower correlation with the rest than ranger
+#Out of the GLM's we choose glmboost, because it has the lowest correlation with avNNet, avNNet and knn.
+
+stack_models_sel <- stack_models[c(1,5,6,10)]
+
+set.seed(765)
+stack_glm <- caretStack(stack_models_sel, method = "glmnet", metric = "Accuracy", trControl = stack_control)
+print(stack_glm)
+
+stack_preds <- as.numeric(predict(stack_glm, newdata = test)) - 1
+stack_probs <- 1 - predict(stack_glm, newdata = test, type = "prob")
+
+mean(stack_preds == test$Survived) #We get 83.5% Accuracy
+auc(test$Survived, stack_probs) #We get an AUC of 0.888
+
+
+#Training on whole training data
+final_dat <- mod_train
+final_dat <- final_dat %>%
+  select(-c(cabin_letter, dup_tic))
+levels(final_dat$Survived ) <- c("Died", "Survived")
+
+
+set.seed(766)
+stack_models_final <- caretList(Survived ~ ., data = final_dat, 
+                          trControl = stack_control,
+                          methodList = algorithm_list)
+
+final_resamples <- resamples(stack_models_final)
+summary(final_resamples)  
+dotplot(final_resamples)
+
+modelCor(final_resamples)
+splom(final_resamples)
+
+
+#Based on the training on the whole dataset, we come up with a slightly modified final algorithm selection
+final_algorithm_list <- c("xgbTree", "avNNet", "glmboost", "svmRadialSigma")
+
+set.seed(767)
+selected_final_models <- caretList(Survived ~ ., data = final_dat,
+                               trControl = stack_control,
+                               methodList = final_algorithm_list)
+
+
+set.seed(768)
+final_model <- caretStack(selected_final_models, method = "glm", metric = "Accuracy", trControl = stack_control)
+print(final_model)
+
+testprobs2 <- 1 - predict(final_model, type = "prob")
+testpreds2 <- ifelse(testprobs2 > 0.5, 1, 0)
+
+mean(testpreds2 == as.numeric(final_dat$Survived) - 1) #91.6% Accuracy on the training set
+auc(as.numeric(final_dat$Survived) - 1 , testpreds2) #0.899 AUC
+
+final_probs <- 1 - predict(final_model, newdata = mod_test, type = "prob")
+final_preds <- as.numeric(predict(final_model, newdata = mod_test)) - 1
+
+submission_data <- test_data
+submission_data$Survived <- final_preds
+
+submission_data <- submission_data %>%
+  select(c(PassengerId, Survived))
+
+write.csv(submission_data, file = "gfistro_titanic_submit_3_11s2.csv", row.names = F)
+
