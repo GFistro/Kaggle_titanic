@@ -1,0 +1,480 @@
+---
+title: "Titanic Submission"
+author: "Gregor Fistravec"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading and combining the data
+
+
+
+We load the required packages and combine the training and testing datasets.
+```{r, message=FALSE}
+library(tidyverse)
+library(rvest)
+library(caret)
+library(pROC)
+library(caretEnsemble)
+titanic_data <- read_csv("../input/titanic/train.csv") #Import training data
+test_data <- read_csv("../input/titanic/test.csv") #Import testing data") #Import testing data
+
+comb_data <- bind_rows(titanic_data, test_data) #We combine both datasets into one
+
+comb_data <- comb_data %>%
+  mutate(train = ifelse(PassengerId %in% 1:891, 1, 0)) #We add the train column, to differentiate between the training and testing datasets
+```
+
+## Data cleaning
+
+We begin by recoding Survived, Pclass, Sex and Embarked variables as factors. In the dataset summary we can see that we have missing information in the Age variable, as well as a few missing values in Fare and Embarked variables.
+
+```{r, warning=FALSE}
+comb_data <- comb_data %>%
+  mutate(Survived = as.factor(Survived),
+         Pclass = as.factor(Pclass),
+         Sex = as.factor(Sex),
+         Embarked = as.factor(Embarked))
+
+summary(comb_data) 
+```
+
+
+An interesting variable is Ticket. We can see that there are occasions where we have duplicated tickets - one or more people that were travelling under the same ticket. We define a new variable and compare the age distribution between the groups with and without duplicated tickets.
+
+```{r}
+
+head(table(comb_data$Ticket)) #Some tickets are repeated several times
+
+duplicated_tickets <- comb_data %>% #We filter out the duplicated tickets
+  group_by(Ticket) %>%
+  filter(n() > 1) %>%
+  ungroup()
+
+comb_data <- comb_data %>%
+  mutate(dup_tic = as.factor(ifelse(PassengerId %in% duplicated_tickets$PassengerId, 1, 0)))
+
+ggplot(comb_data[1:891, ], aes(x = Age, y = dup_tic)) +
+  geom_violin() 
+
+```
+
+We see that the age distribution of the duplicated tickets has many more children included than non duplicated tickets. We can assume that a lot of duplicated tickets were family tickets or similar groups of people travelling together. As such, the duplicated tickets are distorting the price so we adjust it and save the values under a new variable.
+
+```{r, message=FALSE}
+comb_data <- comb_data %>% #To get a fairer idea of ticket price, we divide the ticket cost by the number of people on it
+  group_by(Ticket) %>%
+  mutate(total = n()) %>%
+  mutate(fare_real = Fare / total) %>%
+  ungroup()
+```
+
+Plotting the differences in survival between classes and ticket duplicates give us clear trends. Passengers of higher class were more likely to survive and passengers that had duplicated (group) tickets were more likely to survive as well. The reason why the survival was higher for passengers with duplicated tickets is not yet clear, but it might have something to do with the duplicated tickets having a much higher proportion of children, which were presumably rescue priorities.
+```{r}
+comb_data %>%
+  filter(train == 1) %>%
+  ggplot(aes(x = Pclass)) +
+  geom_bar(aes(fill = Survived)) +
+  xlab("Passenger Class") +
+  ylab("Number of People")
+
+comb_data %>%
+  filter(train == 1) %>%
+  ggplot(aes(x = dup_tic)) +
+  geom_bar(aes(fill = Survived)) +
+  xlab("Duplicated Ticket") +
+  ylab("Number of People")
+```
+
+Exploring the relationship between age, sex and class, a few things become apparent. Females in general had a higher survival rate. Children under age of 20 were more likely to survive, especially in class 1 and class 2, less so in class 3.
+```{r, warning=FALSE}
+comb_data[1:891, ] %>% 
+  filter(train == 1) %>%
+  ggplot(aes(x = Age, y = Survived, color = Sex)) +
+  geom_jitter() +
+  facet_wrap(vars(Pclass))
+```
+
+Taking a look at the relationship between survival and the fare price, at first there seems to be a positive correlation between survival and higher fare price, this relationship however dissapears as we take classes into account.
+```{r}
+comb_data %>% 
+  filter(train == 1) %>%
+  ggplot(aes(x = fare_real, y = Survived)) +
+  geom_point(position = "jitter") +
+  geom_boxplot(alpha = 0.6, fill = "lightblue") +
+  xlab("Real Ticket price")
+
+
+comb_data %>% 
+  filter(train == 1) %>%
+  ggplot(aes(x = fare_real, y = Survived)) +
+  geom_point(position = "jitter") +
+  geom_boxplot(alpha = 0.7, fill = "lightblue") +
+  facet_wrap(vars(Pclass), dir = "v") +
+  xlab("Real Ticket price")
+```
+
+
+## Feature engineering
+
+
+We see that the cabins range from A to G - which corresponds to the decks on the Titanic. According to the [diagram](https://upload.wikimedia.org/wikipedia/commons/0/0d/Olympic_%26_Titanic_cutaway_diagram.png) we can see that the A deck is on the top and G deck is on the bottom. It seems reasonable to assume people on the upper decks had a higher survival rate than on the bottom, so we will create a variable based on decks.
+
+Furthermore, the cabin number can give us information regarding the location of the cabin on the deck, according to the ship's [deckplans](https://www.encyclopedia-titanica.org/titanic-deckplans/)
+
+```{r}
+comb_data$Cabin[c(584,541,956,713,216,457,777)] #We see that cabins range from A to G. 
+```
+
+We can also see that some cabins values have several cabins, such as (B57 B59 B63 B66). We can assume that these were the cabins that were bought with group tickets. For our needs, we are going to extract just the first one and use that for the whole group. 
+
+```{r}
+dup_cabs <- c("B51 B53 B55", "B52 B54 B56", "B57 B59 B63 B66", "B58 B60", "B82 B84", "B96 B98", "C22 C26", "C23 C25 C27", "C55 C57", "C62 C64", "D10 D12", "E39 E41", "F E46", "F E57", "F E69", "F G63", "F G73") #We isolate the cabins with more than 1 number
+
+
+dup_ind <- which(comb_data$Cabin %in% dup_cabs) #We save these in a separate index
+```
+
+To confirm our theory that entries with several Cabin values coorespond to group tickets, we filter out the passengers whose cabins were in the list of duplicated cabins and then compare their Ticket numbers to see if tickets and cabins match.
+
+
+```{r}
+comb_data %>%
+  filter(Cabin %in% dup_cabs) %>%
+  select(Name, Ticket, Cabin) %>%
+  arrange(Ticket) %>%
+  print(n = 41)
+```
+
+It turns out that our suspicion was correct and we get well defined groups. This allows us to extract a single cabin value and treat all members of the group as being in that cabin. Additionally, we can see that the cabins in the cases where there are more than just one are located very close to each other on the ship's deckplans, giving some more credibility to our plan of keeping just one cabin from the list.
+
+Next, we separate the Cabin variable into the letter part - the deck and the number of the cabin.
+
+```{r}
+comb_data <- comb_data %>%
+  separate(Cabin, c("cabin_letter", "cabin_number"), sep = 1) #first we separate the Cabin variable to the letter(floor) and number(location)
+
+regnum <- "[[:digit:]]+" 
+
+comb_data$cabin_number <- str_extract(comb_data$cabin_number, regnum) #We extract just the digits from the cabin number column
+
+comb_data <- comb_data %>%
+  mutate(cabin_number = as.integer(cabin_number))
+```
+
+Due to the complex cabin layout, we define two simple functions to help us extract even and odd numbers. Then we split into locations according to the layouts. We split each deck that contains cabins into 3 parts - front, middle and back.
+
+```{r}
+evens <- function(x) subset(x, x %% 2 == 0)
+odds <- function(x) subset(x, x %% 2 != 0)
+
+#Due to a complex layout of cabins on the C deck, we define them separately for later
+c_front <- c(1:54, 56, 58, 60)
+c_mid <- sort(c(odds(55:83), evens(62:90), odds(95:103), 104:122, evens(124:128), evens(130:140)))
+c_back <- sort(c(odds(85:93), evens(92:102), odds(123:127), evens(142:148)))
+
+comb_data <- comb_data %>%
+  mutate(cabin_position = case_when(cabin_letter == "A" & cabin_number < 36 ~ "AF", #We divide the decks in three parts (front - F, middle - M, and back - B)
+                                    cabin_letter == "A" & cabin_number >= 36 ~ "AB",
+                                    cabin_letter == "B" & cabin_number <= 50 ~ "BF",
+                                    cabin_letter == "B" & cabin_number >  50 ~ "BM",
+                                    cabin_letter == "C" & cabin_number %in% c_front ~ "CF",
+                                    cabin_letter == "C" & cabin_number %in% c_mid ~ "CM",
+                                    cabin_letter == "C" & cabin_number %in% c_back ~ "CB",
+                                    cabin_letter == "D" & cabin_number <= 50 ~ "DF",
+                                    cabin_letter == "D" & cabin_number > 50 ~ "DB",
+                                    cabin_letter == "D" & is.na(cabin_number) ~ "DB",
+                                    cabin_letter == "E" & cabin_number <= 27 | cabin_number %in% 200:203 ~ "EF",
+                                    cabin_letter == "E" & cabin_number %in% 28:76 ~ "EM",
+                                    cabin_letter == "E" & cabin_number %in% 77:167 ~ "EB",
+                                    cabin_letter == "F"  ~ "FB",
+                                    cabin_letter == "G"  ~ "G",
+                                    cabin_letter == "T" ~ "Unknown",  #As there is only one case
+                                    is.na(cabin_letter) ~ "Unknown"))
+
+#Now that we have our cabin_position variable, we can delete the cabin_number. We will keep the cabin letter (deck) as it might turn out to be a better predictor.
+
+comb_data <- comb_data %>%
+  select(- c(cabin_number, total)) %>%
+  mutate(cabin_position = factor(cabin_position),
+         Sex = factor(Sex),
+         Embarked = factor(Embarked))
+```
+
+```{r}
+
+comb_data$cabin_letter <- ifelse(is.na(comb_data$cabin_letter), "Unknown", comb_data$cabin_letter)
+comb_data$cabin_letter <- as.factor(comb_data$cabin_letter)
+
+table(comb_data$cabin_position) #Some of them are very rare (AB, DB, EB, G), might turn out to be problematic
+```
+
+Next we try to fill in as much missing passenger age data as possible. For this purpose we will extract the passenger data from a Wikipedia [page](https://en.wikipedia.org/wiki/Passengers_of_the_Titanic) and join the data with our original dataset, hoping to fill in the missing information.
+
+```{r}
+page <- read_html("https://en.wikipedia.org/wiki/Passengers_of_the_Titanic") #Wikipedia page about Titanic passengers
+
+alltables <- page %>% html_table(fill = T) #We read the Wikipedia website contents
+
+table1 <- alltables[[2]] #We extract the 3 tables that contain information about the passengers
+table2 <- alltables[[3]]
+table3 <- alltables[[4]]
+
+head(table1)
+```
+
+We remove additional titles  from the names in the data from Wikipedia, as such titles aren't included in the original dataset. Additionally we format the two tables in order to get as few problems performing the join as possible.
+
+```{r}
+name_remove <- c("Mr.", "Miss.", "Master.", "and", "née", "chauffeur", "maid", "nurse", "valet", "manservant", "Reverend", "dragoman", "clerk", "secretary", "cook") #We list common words, which were parts of names, but weren't names
+
+titanic_data_names <- comb_data #We copy the datset before manipulation
+
+titanic_data_names$Name <- str_remove_all(titanic_data_names$Name, paste(name_remove, collapse = "|")) #We remove all the titles from the names
+titanic_data_names$Name <- gsub("[[:punct:]]", "", titanic_data_names$Name) #We remove all the punctuation from the names
+titanic_data_names$Name <- gsub("  ", " ", titanic_data_names$Name) #Removing white space left
+
+table3 <- select(table3, - 'Home country') %>% #We remove the additional infromation from table 3, which is not important for us
+  mutate(Age = age) %>%
+  select(- age)
+
+wikitable <- bind_rows(table1, table2, table3) #Bind all three tables together
+
+wikitable <- wikitable %>% #Selecting just the name and the age from the wikipedia tables
+  select(Name, Age)
+
+wikitable$Name <- str_remove_all(wikitable$Name, paste(name_remove, collapse = "|"))
+wikitable$Name <- gsub("[[:punct:]]", "", wikitable$Name)
+wikitable$Name <- str_remove_all(wikitable$Name, "[:digit:]") 
+wikitable$Name <- gsub("[å,ä]", "a", wikitable$Name)
+wikitable$Name <- gsub("[é,è,ë]", "e", wikitable$Name)
+wikitable$Name <- gsub("[ö,ø]", "o", wikitable$Name)
+wikitable$Name <- gsub("[ž]", "z", wikitable$Name)
+wikitable$Name <- gsub("[č,ć]", "c", wikitable$Name)
+wikitable$Name <- gsub("[Č,Ć]", "C", wikitable$Name)
+wikitable$Name <- gsub("  ", " ", wikitable$Name)
+
+
+join_table <- left_join(titanic_data_names, wikitable, by = "Name", suffix = c(".kaggle", ".wiki")) #We join the two tables
+sum(is.na(join_table$Age.wiki)) #We see that joining didn't work perfectly. There is 575 resulting NA's 
+```
+
+To try to figure out what led to unsuccessful joins we take a look at one specific example which suggests that the reason might be different naming conventions between the two datasets.
+
+```{r}
+join_table[20, ]$Name
+
+wikitable[grepl("Masselmani", wikitable$Name), ] #Searching for Masselmani finds no match in the data from Wikipedia
+wikitable[grepl("Fatima", wikitable$Name), ] #Searching for first name, we can find the match. The reason is a slightly differently spelled last name.
+```
+
+Next we join the Age data we got into one variable, preferring the original age data if there was a difference between the two. We see that after the join we still have 131 cases with missing age information, which is however still a good improvement over the 263 missing values in total in the beginning.
+
+```{r, warning=FALSE}
+join_table[(is.na(join_table$Age.kaggle) & is.na(join_table$Age.wiki)), c(1,4,5,6,17)] #In total we have 131 cases, where we dont have the Age data in the original dataset, nor was there a match in the Wikipedia one
+
+join_table$Age.wiki <- as.numeric(join_table$Age.wiki)
+
+join_table <- join_table %>%
+  mutate(Age = case_when(!is.na(Age.kaggle) ~ Age.kaggle,
+                         is.na(Age.kaggle) & !is.na(Age.wiki) ~ Age.wiki,
+                         TRUE ~ NA_real_)) %>%
+  select(-c(Age.kaggle, Age.wiki)) #We supplement the original values with the ones we got from wikipedia, where applicable
+
+sum(is.na(join_table$Age)) #We have 133 missing Age values in the joined table¸
+```
+
+We remove the resulting duplicates and clean up the rest of the dataset before dealing with the missing age information. 
+
+```{r}
+which(duplicated(join_table)) #Check for duplicates after joining
+
+join_table <- join_table[-c(437,699,895), ] #Removing the duplicates
+which(duplicated(join_table)) #No duplicates left
+
+titanic_data_clean <- join_table
+
+```
+
+We are going to take the information about the number of siblings and parents on board and transform them into a single variable - Family_size. Additionally, since we know that many tickets were bought by groups, who stayed in the same cabins but weren't neccessarily family, we will also include those in Group_size.
+
+Finally we are going to give each group an ID and transform it into a factor. This might give the algorithm a chance to look at the survival trend in each group and try to extrapolate from there.
+
+```{r}
+
+titanic_data_clean <- titanic_data_clean %>%
+  mutate(Family_size = SibSp + Parch + 1)
+
+titanic_data_clean[titanic_data_clean$Ticket == 349909, c(1,4,6,7,17)]
+
+ggplot(titanic_data_clean[1:891, ], aes(x=as.factor(Family_size), fill = Survived)) +
+  geom_bar(position = "fill") +
+  xlab("Family size") +
+  ylab("Proportion") +
+  stat_count(geom = "text",
+             aes(label = paste0("*", stat(count))),
+             position = position_fill(vjust = 0.5)) +
+  geom_text(x = 7.6, y = 0.9, size = 3, label = "* Number of individuals")
+```
+
+We see that larger families (> 5 memebers), and families with only 1 member had lower survival rates than families of other sizes.
+
+```{r}
+
+### Group ID and Group size
+
+titanic_data_clean <- titanic_data_clean %>%
+  group_by(Ticket) %>%
+  mutate(Group_ID = cur_group_id()) %>%
+  ungroup()
+
+
+titanic_data_clean <- titanic_data_clean %>%
+  group_by(Ticket) %>%
+  mutate(Group_size = n()) %>%
+  ungroup()
+
+ggplot(titanic_data_clean[1:891, ], aes(x=as.factor(Group_size), fill = Survived)) +
+  geom_bar(position = "fill") +
+  xlab("Group size") +
+  ylab("Proportion") +
+  stat_count(geom = "text",
+             aes(label = paste0("*", stat(count))),
+             position = position_fill(vjust = 0.5)) +
+  geom_text(x = 7.6, y = 0.9, size = 3, label = "* Number of individuals")
+
+```
+
+Taking group size that is not necessarily family into account, we see very similar trends.
+
+Finally we transform the Group_ID variable into a categorical variable along with variables on the number of siblings, parents and whether the data comes from a training set or not. Additionally we impute two NA's from Embarked with the most common value - S. We also impute the missing information about the fare amount with the median, since there is only one missing record.
+
+```{r}
+
+titanic_data_clean[titanic_data_clean$Ticket == 113503, c(4,6,7,8,17,18, 19)] #We can see groups forming, which are not comprised only from families.
+
+titanic_data_clean$Group_ID <- as.factor(ifelse(titanic_data_clean$Group_size == 1, "no_group", titanic_data_clean$Group_ID))
+
+titanic_data_clean <- titanic_data_clean %>%
+  mutate(Embarked = as.factor(ifelse(is.na(Embarked), "S", as.character(Embarked))),
+         fare_real = ifelse(is.na(fare_real), median(fare_real, na.rm = T), fare_real),
+         SibSp = as.factor(SibSp),
+         Parch = as.factor(Parch),
+         train = as.factor(train)) 
+```
+
+
+To fill in the remaining missing Age information, we will perform a KNN impute.
+
+```{r}
+knnpp <- preProcess(as.data.frame(titanic_data_clean[, -1]), method = "knnImpute")
+titanic_data_clean <- predict(knnpp, titanic_data_clean)
+```
+
+
+Next we take a look at the relationship between the survival rate and the cabin positions / decks.
+
+```{r}
+titanic_data_clean[1:891, ] %>%
+  group_by(cabin_position) %>%
+  mutate(sur_rate = mean(as.numeric(Survived) - 1, na.rm = T), tot = n()) %>% #We add the total number of passengers
+  ungroup() %>%
+  ggplot(aes(x = cabin_position, y = sur_rate)) +
+  geom_point() +
+  geom_text(aes(label = tot, vjust = -1), size = 3) +
+  xlab("Cabin Position") #Looking at the survival distribution by the cabin_position
+
+
+titanic_data_clean[1:891, ] %>%
+  group_by(cabin_letter) %>%
+  mutate(sur_rate = mean(as.numeric(Survived) - 1, na.rm = T), tot = n()) %>%
+  ungroup() %>%
+  ggplot(aes(x = cabin_letter, y = sur_rate)) +
+  geom_point() +
+  geom_text(aes(label = tot, vjust = -1), size = 3) +
+  xlab("Deck") #Looking at the survival distribution by deck
+
+```
+
+There does not appear to be any clear relationship for the difference in survival between cabins and decks. 
+
+Further, we take another look at the relationship between survival and age. Comparing the shape of the age distributions between victims and survivors, we can see the biggest differences at the lowest ages. It is clear, that there was much more children that survived than died, which is a relationship that isn't observable in other age ranges.
+
+
+```{r}
+titanic_data_clean[1:891, ] %>%
+  drop_na(Survived)
+ggplot(titanic_data_clean[1:891, ], aes(x = Survived, y = Age)) +
+  geom_violin()
+
+```
+
+Finally we remove some variables and get the data ready for modelling.
+
+```{r}
+titanic_data_mod <- titanic_data_clean %>% 
+  select(-c(PassengerId, Name, Ticket, Embarked, Fare, SibSp, Parch)) 
+
+summary(titanic_data_mod) #Everything seems clean and ready for modelling.
+```
+
+### Modelling using Caret
+
+For model training we are going to use a ensemble of XGBoost, avNNet, glmnet and SVM with a radial Sigma. For the ensemble model optimization, we're going to use glm.
+
+Finally, we're going to save the observations in a separate table.
+
+```{r, warning=FALSE, message=FALSE}
+mod_train <- subset(titanic_data_mod, train == 1)
+mod_test <- subset(titanic_data_mod, train == 0)
+
+mod_train <- select(mod_train, -train)
+mod_test <- select(mod_test, -train)
+
+
+final_dat <- mod_train
+final_dat <- final_dat %>%
+  select(-c(cabin_letter, dup_tic))
+levels(final_dat$Survived ) <- c("Died", "Survived")
+
+
+fit_control <- trainControl(method = "repeatedcv",
+                            number = 10,
+                            repeats = 10)
+
+stack_control <- trainControl(method = "repeatedcv", number = 10, repeats = 5, savePredictions = T, classProbs = T)
+
+
+final_algorithm_list <- list(xgbTree = caretModelSpec(method = "xgbTree", verbosity = 0),
+                             avNNet = caretModelSpec(method = "avNNet", trace = FALSE),
+                             glmboost = caretModelSpec(method = "glmboost"),
+                             svmRadialSigma = caretModelSpec(method = "svmRadialSigma"))
+
+set.seed(767)
+selected_final_models <- caretList(Survived ~ ., data = final_dat,
+                                   trControl = stack_control,
+                                   tuneList = final_algorithm_list)
+
+
+set.seed(768)
+final_model <- caretStack(selected_final_models, method = "glm", metric = "Accuracy", trControl = stack_control)
+print(final_model)
+
+testprobs2 <- 1 - predict(final_model, type = "prob")
+testpreds2 <- ifelse(testprobs2 > 0.5, 1, 0)
+
+mean(testpreds2 == as.numeric(final_dat$Survived) - 1) #91.6% Accuracy on the training set
+auc(as.numeric(final_dat$Survived) - 1 , testpreds2) #0.905 AUC
+
+final_probs <- 1 - predict(final_model, newdata = mod_test, type = "prob")
+final_preds <- as.numeric(predict(final_model, newdata = mod_test)) - 1
+
+submission_data <- test_data
+submission_data$Survived <- final_preds
+
+submission_data <- submission_data %>%
+  select(c(PassengerId, Survived))
+```
