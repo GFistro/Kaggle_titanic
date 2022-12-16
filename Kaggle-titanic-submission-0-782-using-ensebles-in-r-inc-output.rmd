@@ -11,7 +11,6 @@ knitr::opts_chunk$set(echo = TRUE)
 ## Loading and combining the data
 
 
-
 We load the required packages and combine the training and testing datasets.
 ```{r, message=FALSE}
 library(tidyverse)
@@ -19,8 +18,10 @@ library(rvest)
 library(caret)
 library(pROC)
 library(caretEnsemble)
-titanic_data <- read_csv("../input/titanic/train.csv") #Import training data
-test_data <- read_csv("../input/titanic/test.csv") #Import testing data") #Import testing data
+
+## We load the data
+titanic_data <- read_csv("../input/titanic/train.csv") #Import training data
+test_data <- read_csv("../input/titanic/test.csv") #Import testing data") 
 
 comb_data <- bind_rows(titanic_data, test_data) #We combine both datasets into one
 
@@ -465,6 +466,21 @@ print(final_model)
 
 testprobs2 <- 1 - predict(final_model, type = "prob")
 testpreds2 <- ifelse(testprobs2 > 0.5, 1, 0)
+
+mean(testpreds2 == as.numeric(final_dat$Survived) - 1) #91.6% Accuracy on the training set
+auc(as.numeric(final_dat$Survived) - 1 , testpreds2) #0.905 AUC
+
+final_probs <- 1 - predict(final_model, newdata = mod_test, type = "prob")
+final_preds <- as.numeric(predict(final_model, newdata = mod_test)) - 1
+
+submission_data <- test_data
+submission_data$Survived <- final_preds
+
+submission_data <- submission_data %>%
+  select(c(PassengerId, Survived))
+
+write.csv(submission_data, file = "gfistro_titanic_notebook_submit.csv", row.names = F)
+```
 
 mean(testpreds2 == as.numeric(final_dat$Survived) - 1) #91.6% Accuracy on the training set
 auc(as.numeric(final_dat$Survived) - 1 , testpreds2) #0.905 AUC
